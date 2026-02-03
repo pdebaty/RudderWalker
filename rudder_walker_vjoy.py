@@ -29,11 +29,16 @@ sensitivity = FloatVariable("Sensitivity", "Gain", 0.8, 0.01, 5.0)
 decay_rate = FloatVariable("Decay Rate", "Friction", 0.95, 0.1, 0.99)
 
 # Run hold settings
+sprint_enabled = BoolVariable("Sprint Feature Enabled", "Enable/Disable sprint button functionality", True)
 run_threshold = FloatVariable("Run Threshold", "Velocity to hold sprint button", 0.7, 0.1, 0.95)
 run_duration = FloatVariable("Run Duration", "Time above threshold to trigger (seconds)", 0.2, 0.1, 1.0)
-run_button = IntegerVariable("Run Button", "vJoy button to hold", 1, 1, 32)
+run_button = IntegerVariable("Run Button", "vJoy button to hold for sprint", 1, 1, 32)
 
-direction_threshold = FloatVariable("Direction Threshold", "Toe brake value for full lateral movement", 0.8, 0.1, 1.0)
+# Toe brake behavior settings
+TOE_BRAKE_MODE_CROUCH = 0
+TOE_BRAKE_MODE_BACKWARD = 1
+toe_brake_mode = IntegerVariable("Toe Brake Mode", "0=Crouch Toggle, 1=Backward Movement", TOE_BRAKE_MODE_CROUCH, 0, 1)
+crouch_button = IntegerVariable("Crouch Button", "vJoy button to hold for crouch", 2, 1, 32)
 
 class TreadmillState:
     velocity = 0.0
@@ -47,8 +52,13 @@ class TreadmillState:
     is_running = False
     above_threshold_time = None
     
+    # Toe brake state
     left_brake_value = 0.0  
-    right_brake_value = 0.0  
+    right_brake_value = 0.0
+    both_brakes_pressed = False
+    
+    # Crouch state
+    is_crouching = False
 
 state = TreadmillState()
 
@@ -59,6 +69,13 @@ state = TreadmillState()
 def update_run_state(vjoy_handle, current_time):
     """Updates the sprint button state based on current velocity (Hold Logic)"""
     try:
+        # Skip sprint logic if sprint feature is disabled or if crouching
+        if not sprint_enabled.value or state.is_crouching:
+            return
+            
+        # Get lateral movement to check if we should maintain run state
+        has_lateral_movement = state.left_brake_value > 0.1 or state.right_brake_value > 0.1
+        
         # Check if we should START holding the sprint button
         if not state.is_running and state.velocity >= run_threshold.value:
             if state.above_threshold_time is None:
@@ -73,8 +90,8 @@ def update_run_state(vjoy_handle, current_time):
             state.above_threshold_time = None
 
         # Check if we should RELEASE the sprint button
-        # We release if velocity drops significantly below the threshold
-        if state.is_running and state.velocity < run_threshold.value:
+        # We release if velocity drops significantly below the threshold AND there's no lateral movement
+        if state.is_running and state.velocity < run_threshold.value and not has_lateral_movement:
             state.is_running = False
             state.above_threshold_time = None
             vjoy_handle[state.vjoy_id].button(run_button.value).is_pressed = False
@@ -83,43 +100,57 @@ def update_run_state(vjoy_handle, current_time):
     except Exception as e:
         syslog.error(f"Rudder Treadmill: Error updating run button: {str(e)}")
 
-def apply_directional_movement(vjoy_handle):
+def toggle_crouch_mode(vjoy_handle):
+    """Toggle crouch mode on/off"""
+    state.is_crouching = not state.is_crouching
+    
+    try:
+        # Update crouch button state
+        vjoy_handle[state.vjoy_id].button(crouch_button.value).is_pressed = state.is_crouching
+        
+        # If we're crouching, make sure sprint is off
+        if state.is_crouching and state.is_running:
+            state.is_running = False
+            vjoy_handle[state.vjoy_id].button(run_button.value).is_pressed = False
+        
+        syslog.info(f"Rudder Treadmill: CROUCH {'ON' if state.is_crouching else 'OFF'}")
+    except Exception as e:
+        syslog.error(f"Rudder Treadmill: Error toggling crouch mode: {str(e)}")
+
+def apply_forward_movement(vjoy_handle):
+    """Calculate forward movement value based on velocity and toe brake mode"""
     if state.velocity <= 0.01:
         try:
             vjoy_handle[state.vjoy_id].axis(vjoy_forward_axis.value).value = 0.0
-            vjoy_handle[state.vjoy_id].axis(vjoy_lateral_axis.value).value = 0.0
         except Exception as e:
-            syslog.error(f"Rudder Treadmill: Error zeroing vJoy axes: {str(e)}")
-        return 0.0, 0.0
+            syslog.error(f"Rudder Treadmill: Error zeroing forward axis: {str(e)}")
+        return 0.0
     
-    left_ratio = min(1.0, state.left_brake_value / direction_threshold.value)
-    right_ratio = min(1.0, state.right_brake_value / direction_threshold.value)
-    
-    forward_value = 0.0
-    lateral_value = 0.0
-    
-    if state.left_brake_value > 0.1 and state.right_brake_value > 0.1:
-        backward_intensity = max(left_ratio, right_ratio)
-        forward_value = -state.velocity * backward_intensity
-        lateral_value = 0.0
-    else:
-        forward_reduction = max(left_ratio, right_ratio)
-        forward_value = state.velocity * (1.0 - forward_reduction)
-        
-        if state.left_brake_value > 0.1:
-            lateral_value = state.velocity * left_ratio
-        elif state.right_brake_value > 0.1:
-            lateral_value = -state.velocity * right_ratio
-        else:
-            lateral_value = 0.0
+    forward_value = state.velocity
+
+    if state.both_brakes_pressed and toe_brake_mode.value == TOE_BRAKE_MODE_BACKWARD:
+        forward_value = -forward_value
     
     try:
         vjoy_handle[state.vjoy_id].axis(vjoy_forward_axis.value).value = forward_value
-        vjoy_handle[state.vjoy_id].axis(vjoy_lateral_axis.value).value = lateral_value
     except Exception as e:
-        syslog.error(f"Rudder Treadmill: Error updating vJoy axes: {str(e)}")
+        syslog.error(f"Rudder Treadmill: Error updating forward axis: {str(e)}")
     
-    return forward_value, lateral_value
+    return forward_value
+
+def check_both_brakes_state(vjoy_handle):
+    """Check if both brakes are pressed/released and handle accordingly"""
+    both_pressed = state.left_brake_value > 0.1 and state.right_brake_value > 0.1
+    
+    # If both brakes just got pressed, record the state
+    if both_pressed and not state.both_brakes_pressed:
+        state.both_brakes_pressed = True
+    
+    # If both brakes were pressed but now released, toggle crouch in crouch mode
+    elif not both_pressed and state.both_brakes_pressed:
+        state.both_brakes_pressed = False
+        if toe_brake_mode.value == TOE_BRAKE_MODE_CROUCH:
+            toggle_crouch_mode(vjoy_handle)
 
 def decay_loop(vjoy_handle):
     syslog.info("Rudder Treadmill: Decay thread started")
@@ -130,18 +161,22 @@ def decay_loop(vjoy_handle):
         if state.velocity < 0.01:
             state.velocity = 0.0
         
-        apply_directional_movement(vjoy_handle)
+        apply_forward_movement(vjoy_handle)
         update_run_state(vjoy_handle, current_time)
         time.sleep(0.02)
     
     try:
         vjoy_handle[state.vjoy_id].axis(vjoy_forward_axis.value).value = 0.0
-        vjoy_handle[state.vjoy_id].axis(vjoy_lateral_axis.value).value = 0.0
+        # Don't reset lateral axis here as it's controlled directly by toe brakes
+        
         # Ensure button is released when stopping
-        if state.is_running:
-            state.is_running = False
-            vjoy_handle[state.vjoy_id].button(run_button.value).is_pressed = False
-            syslog.info("Rudder Treadmill: SPRINT HOLD OFF (velocity zero)")
+        if sprint_enabled.value and state.is_running and not state.is_crouching:
+            # Only release if there's no lateral movement
+            has_lateral_movement = state.left_brake_value > 0.1 or state.right_brake_value > 0.1
+            if not has_lateral_movement:
+                state.is_running = False
+                vjoy_handle[state.vjoy_id].button(run_button.value).is_pressed = False
+                syslog.info("Rudder Treadmill: SPRINT HOLD OFF (velocity zero)")
     except Exception as e:
         syslog.error(f"Rudder Treadmill: Error cleaning up: {str(e)}")
     
@@ -160,7 +195,7 @@ def on_rudder_move(event, vjoy):
     if delta > 0.001:
         state.velocity = min(1.0, state.velocity + (delta * sensitivity.value))
     
-    apply_directional_movement(vjoy)
+    apply_forward_movement(vjoy)
     update_run_state(vjoy, current_time)
     
     if state.velocity > 0:
@@ -176,14 +211,30 @@ def on_rudder_move(event, vjoy):
 
 @MFG_Crosswind_V2_Default.axis(2)
 def on_left_brake_move(event, vjoy):
-    state.left_brake_value = (event.value + 1 ) / 2
+    # Normalize from -1.0 to 1.0 range to 0.0 to 1.0 range
+    state.left_brake_value = (event.value + 1) / 2
+    # Check if both brakes state changed
+    check_both_brakes_state(vjoy)
+    if state.both_brakes_pressed:
+        return
+    vjoy[state.vjoy_id].axis(vjoy_lateral_axis.value).value = -state.left_brake_value
+      
+    # Update run state if there's lateral movement
     if state.velocity > 0:
-        apply_directional_movement(vjoy)
+        update_run_state(vjoy, time.time())
 
 @MFG_Crosswind_V2_Default.axis(1)
 def on_right_brake_move(event, vjoy):
+    # Normalize from -1.0 to 1.0 range to 0.0 to 1.0 range
     state.right_brake_value = (event.value + 1) / 2
+    # Check if both brakes state changed
+    check_both_brakes_state(vjoy)
+    if state.both_brakes_pressed:
+        return
+    vjoy[state.vjoy_id].axis(vjoy_lateral_axis.value).value = state.right_brake_value
+    
+    # Update run state if there's lateral movement
     if state.velocity > 0:
-        apply_directional_movement(vjoy)
+        update_run_state(vjoy, time.time())
 
 syslog.info("Rudder Treadmill: Hold-to-Sprint Logic Active")
